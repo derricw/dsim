@@ -30,7 +30,7 @@ type Process struct {
 	// unit of work
 	out map[Pool]int
 	// when did we last start a batch
-	clock time.Time
+	clock []time.Time
 	// how long do we spend waiting on a batch to start
 	idleTime time.Duration
 	// how many batches have we completed and started
@@ -40,67 +40,74 @@ type Process struct {
 	completedBatches  int
 	// name so we can keep track of it
 	name string
+	// number of copies of this process
+	replicas int
 }
 
 // Run runs the process until the specified duration has ended
-func (p *Process) Run(until time.Duration) {
+func (p *Process) RunUntilTime(t time.Duration) {
 	//log.Debugf("%s length: %d - %d", p.name, len(p.in), len(p.out))
+	p.clock = make([]time.Time, p.replicas)
 	t0 := time.Now()
-	p.clock = t0
-	if p.in == nil || len(p.in) == 0 {
-		// we are a producer, first batch at t0
-		// we might not want this?
-		p.produce()
+	for c := range p.clock {
+		p.clock[c] = t0
 	}
 	for {
-		if p.in != nil && len(p.in) > 0 {
-			last := p.consume()
-			if last.After(p.clock) {
-				p.clock = last
+		for r := 0; r < p.replicas; r++ {
+			if p.in != nil && len(p.in) > 0 {
+				last := p.consume(r)
+				if last.After(p.clock[r]) {
+					p.clock[r] = last
+				}
 			}
+			finishTime := p.clock[r].Add(p.duration)
+			if finishTime.Sub(t0) > t {
+				return
+			}
+			p.clock[r] = finishTime
+			p.produce(r)
 		}
-		finishTime := p.clock.Add(p.duration)
-		if finishTime.Sub(t0) > until {
-			return
-		}
-		p.clock = finishTime
-		p.produce()
 	}
 }
 
-func (p *Process) consume() time.Time {
-	log.Debugf("%s started a batch @ %v", p.name, p.clock)
+// consume blocks until a replica consumes a batch
+func (p *Process) consume(replica int) time.Time {
+	log.Debugf("%s-%d started batch #%d @ %v", p.name, replica, p.startedBatches, p.clock[replica])
 	p.startedBatches++
-	var last time.Time
+	var last time.Time = p.clock[replica]
+	p.batching = make([]int, len(p.in)) // to keep track of how many we've batched (for reporting)
+	cursor := 0
 	for ch, c := range p.in {
 		for i := 0; i < c; i++ {
 			t := <-ch
 			if last.Before(t) {
 				last = t
 			}
+			p.batching[cursor]++
 		}
+		cursor++
 	}
 	// calculate idle time
 	// idleTime = idleTime + (last - p.clock)
-	if last.After(p.clock) {
-		waitedFor := last.Sub(p.clock)
+	if last.After(p.clock[replica]) {
+		waitedFor := last.Sub(p.clock[replica])
 		p.idleTime += waitedFor
 	}
 
+	log.Debugf("%s-%d processing batch #%d @ %v", p.name, replica, p.processingBatches, last)
 	p.processingBatches++
-	log.Debugf("%s processing a batch @ %v", p.name, last)
 	return last
 }
 
-func (p *Process) produce() {
+func (p *Process) produce(replica int) {
 	for ch, c := range p.out {
 		for i := 0; i < c; i++ {
-			ch <- p.clock
-			time.Sleep(1 * time.Millisecond)
+			ch <- p.clock[replica]
+			//time.Sleep(1 * time.Millisecond)
 		}
 	}
+	log.Debugf("%s-%d finished batch #%d @ %v", p.name, replica, p.completedBatches, p.clock[replica])
 	p.completedBatches++
-	log.Debugf("%s finished a batch @ %v", p.name, p.clock)
 }
 
 func (p *Process) Report() *ProcessReport {
@@ -113,12 +120,13 @@ func (p *Process) Report() *ProcessReport {
 	return report
 }
 
-func NewProcess(in, out map[Pool]int, duration time.Duration, name string) *Process {
+func NewProcess(in, out map[Pool]int, duration time.Duration, name string, replicas int) *Process {
 	p := &Process{
 		in:       in,
 		out:      out,
 		duration: duration,
 		name:     name,
+		replicas: replicas,
 	}
 	return p
 }
@@ -150,9 +158,9 @@ type Model struct {
 	pools     map[string]Pool
 }
 
-func (m *Model) Run(until time.Duration) {
+func (m *Model) RunUntilTime(t time.Duration) {
 	for _, p := range m.processes {
-		go p.Run(until)
+		go p.RunUntilTime(t)
 	}
 }
 
@@ -160,13 +168,13 @@ func (m *Model) Run(until time.Duration) {
 // Run it after your conditions are met, or it won't be very
 // interesting.
 func (m *Model) Report() {
+	// report what is in the pools
 	poolNames := []string{}
 	for name, _ := range m.pools {
 		poolNames = append(poolNames, name)
 	}
 	sort.Strings(poolNames)
 
-	// sort this!
 	for _, poolName := range poolNames {
 		fmt.Printf("%s\t%d\n", poolName, len(m.pools[poolName]))
 	}
@@ -182,26 +190,17 @@ func NewModelFromConfig(config *ModelConfig) (*Model, error) {
 		in := map[Pool]int{}
 		out := map[Pool]int{}
 
-		// TODO: this got ugly as shit holy god
-		for i := 0; i < conf.Replicas; i++ {
-			log.Debugf("%s: %v", name, conf.In)
-			for poolName, count := range conf.In {
-				log.Debugf("%s: %s %d", name, poolName, count)
-				pool := pools[poolName]
-				in[pool] = count
-			}
-			log.Debugf("%s: %v", name, conf.Out)
-			for poolName, count := range conf.Out {
-				log.Debugf("%s: %s %d", name, poolName, count)
-				pool := pools[poolName]
-				out[pool] = count
-			}
-
-			replicaName := fmt.Sprintf("%s-%d", name, i)
-
-			p := NewProcess(in, out, conf.Duration, replicaName)
-			processes = append(processes, p)
+		for poolName, count := range conf.In {
+			pool := pools[poolName]
+			in[pool] = count
 		}
+		for poolName, count := range conf.Out {
+			pool := pools[poolName]
+			out[pool] = count
+		}
+
+		p := NewProcess(in, out, conf.Duration, name, conf.Replicas)
+		processes = append(processes, p)
 	}
 	return &Model{
 		processes: processes,

@@ -37,13 +37,13 @@ var forCmd = &cobra.Command{
 		if err != nil {
 			log.Fatal(err)
 		}
-		log.Debugf("model: %+#v", m)
+		//log.Debugf("model: %+#v", m)
 		duration, err := time.ParseDuration(args[1])
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		m.Run(duration)
+		m.RunUntilTime(duration)
 		time.Sleep(1 * time.Second) // come up with a way to know when we're done.
 		m.Report()
 	},
