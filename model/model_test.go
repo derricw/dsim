@@ -22,9 +22,10 @@ func TestProcessBasic(t *testing.T) {
 		outputChans,
 		time.Second*2,
 		"TestProcess",
+		1,
 	)
 
-	go p.Run(time.Second * 10)
+	go p.RunUntilTime(time.Second * 10)
 
 	t0 := time.Now()
 	for i := 0; i < inReq; i++ {
@@ -56,22 +57,26 @@ func TestProcessProducer(t *testing.T) {
 		outputChans,
 		time.Second*2,
 		"TestProcess",
+		1,
 	)
 
-	go p.Run(time.Second * 10)
+	go p.RunUntilTime(time.Second * 10)
 
 	t0 := time.Now()
 	// first batch should be sent immediately
-	for i := 0; i < outCount; i++ {
-		select {
-		case tOut := <-outch:
-			if tOut.Sub(t0) > p.duration {
-				t.Errorf("producer took to long to finish first batch!")
+	// NO IT SHOULDNT
+	/*
+		for i := 0; i < outCount; i++ {
+			select {
+			case tOut := <-outch:
+				if tOut.Sub(t0) > p.duration {
+					t.Errorf("producer took to long to finish first batch!")
+				}
+			case <-time.After(time.Second * 1):
+				t.Errorf("failed to receive process output")
 			}
-		case <-time.After(time.Second * 1):
-			t.Errorf("failed to receive process output")
 		}
-	}
+	*/
 	// second batch should come just after `duration`
 	for i := 0; i < outCount; i++ {
 		select {
@@ -105,9 +110,10 @@ func TestProcessTwoInputs(t *testing.T) {
 		outputChans,
 		time.Second*2,
 		"TestProcess",
+		1,
 	)
 
-	go p.Run(time.Second * 10)
+	go p.RunUntilTime(time.Second * 10)
 
 	t0 := time.Now()
 	for i := 0; i < inReq; i++ {

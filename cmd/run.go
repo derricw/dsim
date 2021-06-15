@@ -9,8 +9,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var Verbose bool
+
 func init() {
 	//atCmd.Flags().StringVarP(&storageAddr, "storage", "s", "", "storage address")
+	runCmd.PersistentFlags().BoolVarP(&Verbose, "verbose", "v", false, "verbose mode")
 	runCmd.AddCommand(forCmd)
 	rootCmd.AddCommand(runCmd)
 }
@@ -31,8 +34,10 @@ var forCmd = &cobra.Command{
 	Long:  ``,
 	Args:  cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
-		log.SetLevel(log.DebugLevel)
-		log.Printf("running model @ %v", args)
+		if Verbose {
+			log.SetLevel(log.DebugLevel)
+		}
+		log.Infof("running model @ %v", args)
 		m, err := model.NewModelFromFile(args[0])
 		if err != nil {
 			log.Fatal(err)

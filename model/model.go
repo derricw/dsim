@@ -2,8 +2,11 @@ package model
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
+	"os"
 	"sort"
+	"text/tabwriter"
 	"time"
 
 	"github.com/go-yaml/yaml"
@@ -42,6 +45,8 @@ type Process struct {
 	name string
 	// number of copies of this process
 	replicas int
+	// track whether replicas are done
+	replicasDone []bool
 }
 
 // Run runs the process until the specified duration has ended
@@ -53,6 +58,9 @@ func (p *Process) RunUntilTime(t time.Duration) {
 		p.clock[c] = t0
 	}
 	for {
+		if p.completed() {
+			return // don't return until all replicas are done
+		}
 		for r := 0; r < p.replicas; r++ {
 			if p.in != nil && len(p.in) > 0 {
 				last := p.consume(r)
@@ -60,9 +68,14 @@ func (p *Process) RunUntilTime(t time.Duration) {
 					p.clock[r] = last
 				}
 			}
+			log.Debugf("%s-%d processing batch #%d @ %v", p.name, r, p.processingBatches, p.clock[r])
+			p.processingBatches++
+
+			// are we finished?
 			finishTime := p.clock[r].Add(p.duration)
 			if finishTime.Sub(t0) > t {
-				return
+				p.replicasDone[r] = true // mark this replica done
+				continue
 			}
 			p.clock[r] = finishTime
 			p.produce(r)
@@ -94,8 +107,6 @@ func (p *Process) consume(replica int) time.Time {
 		p.idleTime += waitedFor
 	}
 
-	log.Debugf("%s-%d processing batch #%d @ %v", p.name, replica, p.processingBatches, last)
-	p.processingBatches++
 	return last
 }
 
@@ -103,30 +114,45 @@ func (p *Process) produce(replica int) {
 	for ch, c := range p.out {
 		for i := 0; i < c; i++ {
 			ch <- p.clock[replica]
-			//time.Sleep(1 * time.Millisecond)
 		}
 	}
 	log.Debugf("%s-%d finished batch #%d @ %v", p.name, replica, p.completedBatches, p.clock[replica])
 	p.completedBatches++
 }
 
+func (p *Process) completed() bool {
+	for _, done := range p.replicasDone {
+		if !done {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *Process) Report() *ProcessReport {
 	report := &ProcessReport{
 		Name:              p.name,
 		BatchesCompleted:  p.completedBatches,
-		BatchesInProgress: p.completedBatches - p.startedBatches,
+		BatchesInProgress: p.processingBatches - p.completedBatches,
 		IdleTime:          p.idleTime,
 	}
 	return report
 }
 
+// WriteReport writes a TSV report
+func (p *Process) WriteReport(w io.Writer) {
+	r := p.Report()
+	fmt.Fprintf(w, "\n%s\t%d\t%d\t%s", r.Name, r.BatchesCompleted, r.BatchesInProgress, r.IdleTime)
+}
+
 func NewProcess(in, out map[Pool]int, duration time.Duration, name string, replicas int) *Process {
 	p := &Process{
-		in:       in,
-		out:      out,
-		duration: duration,
-		name:     name,
-		replicas: replicas,
+		in:           in,
+		out:          out,
+		duration:     duration,
+		name:         name,
+		replicas:     replicas,
+		replicasDone: make([]bool, replicas),
 	}
 	return p
 }
@@ -168,7 +194,21 @@ func (m *Model) RunUntilTime(t time.Duration) {
 // Run it after your conditions are met, or it won't be very
 // interesting.
 func (m *Model) Report() {
+	// report what is in progress
+	tw := new(tabwriter.Writer)
+	// minwidth, tabwidth, padding, padchar, flags
+	tw.Init(os.Stdout, 8, 8, 0, '\t', 0)
+	for _, p := range m.processes {
+		p.WriteReport(tw)
+	}
+	fmt.Fprintf(tw, "\n")
+	tw.Flush()
+
 	// report what is in the pools
+	tw = new(tabwriter.Writer)
+	tw.Init(os.Stdout, 8, 8, 0, '\t', 0)
+
+	// sort them first
 	poolNames := []string{}
 	for name, _ := range m.pools {
 		poolNames = append(poolNames, name)
@@ -176,8 +216,10 @@ func (m *Model) Report() {
 	sort.Strings(poolNames)
 
 	for _, poolName := range poolNames {
-		fmt.Printf("%s\t%d\n", poolName, len(m.pools[poolName]))
+		fmt.Fprintf(tw, "\n%s\t %d", poolName, len(m.pools[poolName]))
 	}
+	fmt.Fprintf(tw, "\n")
+	tw.Flush()
 }
 
 func NewModelFromConfig(config *ModelConfig) (*Model, error) {
