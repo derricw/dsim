@@ -1,2 +1,5 @@
 bin/*
 *.swp
+cov.cov
+coverage.html
+go.sum
