@@ -14,6 +14,7 @@ import (
 )
 
 type Pool chan time.Time
+type ConditionSet map[string]int
 
 type ProcessReport struct {
 	BatchesCompleted  int
@@ -49,8 +50,49 @@ type Process struct {
 	replicasDone []bool
 }
 
-// Run runs the process until the specified duration has ended
+// RunUntilTime runs the process until the specified duration has ended
 func (p *Process) RunUntilTime(t time.Duration) {
+	//log.Debugf("%s length: %d - %d", p.name, len(p.in), len(p.out))
+	p.clock = make([]time.Time, p.replicas)
+	t0 := time.Now()
+	for c := range p.clock {
+		p.clock[c] = t0
+	}
+	for {
+		if p.completed() {
+			return // don't return until all replicas are done
+		}
+		for r := 0; r < p.replicas; r++ {
+			if p.in != nil && len(p.in) > 0 {
+				last := p.consume(r)
+				if last.After(p.clock[r]) {
+					p.clock[r] = last
+				}
+			}
+			log.Debugf("%s-%d processing batch #%d @ %v", p.name, r, p.processingBatches, p.clock[r])
+			if p.clock[r].Sub(t0) <= t {
+				// as long as the last one came in before finish time
+				// we start processing
+				p.processingBatches++
+			}
+
+			// are we finished?
+			finishTime := p.clock[r].Add(p.duration)
+			if finishTime.Sub(t0) > t {
+				p.replicasDone[r] = true // mark this replica done
+				continue
+			}
+
+			p.clock[r] = finishTime
+			p.produce(r)
+		}
+	}
+}
+
+// RunUntilConditions runs the process until the specified duration has ended
+// TODO: lets find a way to refactor this and RunUntilTime so there isn't as much duplicate code
+func (p *Process) RunUntilConditions(conditions ConditionSet, finishedChan chan struct{}) {
+
 	//log.Debugf("%s length: %d - %d", p.name, len(p.in), len(p.out))
 	p.clock = make([]time.Time, p.replicas)
 	t0 := time.Now()
@@ -72,15 +114,22 @@ func (p *Process) RunUntilTime(t time.Duration) {
 			p.processingBatches++
 
 			// are we finished?
-			finishTime := p.clock[r].Add(p.duration)
-			if finishTime.Sub(t0) > t {
-				p.replicasDone[r] = true // mark this replica done
+			if p.CheckConditions(conditions) {
+				p.replicasDone[r] = true
+				finishedChan <- struct{}{}
 				continue
 			}
+
+			finishTime := p.clock[r].Add(p.duration)
 			p.clock[r] = finishTime
 			p.produce(r)
 		}
 	}
+}
+
+func (p *Process) CheckConditions(conditions ConditionSet) bool {
+
+	return true
 }
 
 // consume blocks until a replica consumes a batch
@@ -179,6 +228,9 @@ func NewModelConfigFromFile(path string) (*ModelConfig, error) {
 	return m, nil
 }
 
+// Model contains a slice of `Process` and a map of `Pool`. You can run
+// the model, which will run all processes until a condition is met.
+// You can then print out a report on the state of the model.
 type Model struct {
 	processes []*Process
 	pools     map[string]Pool
@@ -190,6 +242,14 @@ func (m *Model) RunUntilTime(t time.Duration) {
 	}
 }
 
+func (m *Model) RunUntilConditions(conditions ConditionSet) {
+	finishedChan := make(chan struct{})
+	for _, p := range m.processes {
+		go p.RunUntilConditions(conditions, finishedChan)
+	}
+	<-finishedChan
+}
+
 // Report prints a report on the state of our model.
 // Run it after your conditions are met, or it won't be very
 // interesting.
@@ -198,6 +258,14 @@ func (m *Model) Report() {
 	tw := new(tabwriter.Writer)
 	// minwidth, tabwidth, padding, padchar, flags
 	tw.Init(os.Stdout, 8, 8, 0, '\t', 0)
+	fmt.Fprintf(tw, "\nProcess\t Completed\tInProgress\tIdleTime")
+	fmt.Fprintf(tw, "\n-------\t ---------\t----------\t--------")
+
+	// sort processes by name
+	sort.Slice(m.processes, func(i, j int) bool {
+		return m.processes[i].name < m.processes[j].name
+	})
+
 	for _, p := range m.processes {
 		p.WriteReport(tw)
 	}
@@ -207,6 +275,8 @@ func (m *Model) Report() {
 	// report what is in the pools
 	tw = new(tabwriter.Writer)
 	tw.Init(os.Stdout, 8, 8, 0, '\t', 0)
+	fmt.Fprintf(tw, "\nPool\t Unbatched\tBatched")
+	fmt.Fprintf(tw, "\n----\t ---------\t-------")
 
 	// sort them first
 	poolNames := []string{}
